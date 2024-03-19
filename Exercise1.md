@@ -177,4 +177,4 @@ plot(g,
      vertex.label.cex = 0.5)
 ```
 
-![](Exercise1_files/figure-gfm/igraph-1.png)<!-- -->
+![]([Exercise1_files/figure-gfm/igraph-1.png](https://github.com/ChienChen99/NetworkAnalytics/blob/main/igraph-1.png)https://github.com/ChienChen99/NetworkAnalytics/blob/main/igraph-1.png)<!-- -->
