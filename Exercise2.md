@@ -185,4 +185,4 @@ interpersonal communication.
            legend=c("Degree Centrality Closeness Centrality Betweenness Centrality"), # Legend text
            ) # Margin around the legend
 
-![](Exercise2_files/figure-markdown_strict/Network%20Analysis-1.png)
+![Network Analysis](https://github.com/ChienChen99/NetworkAnalytics/blob/main/Network%20Analysis-1.png)
