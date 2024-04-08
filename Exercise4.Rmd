@@ -1,0 +1,459 @@
+---
+title: "Network Analysis - Exercise 4"
+output: 
+  md_document: default
+  github_document: default
+  pdf_document: default
+date: "2024-04-07"
+---
+
+# Initialisation of libraries and dataset
+
+## Import Libraries
+
+```{r Setup}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=60), format='latex', echo=TRUE)
+library(tidyverse)
+library(lubridate)
+library(arrow)
+library(tibble)
+library(dplyr)
+```
+
+## Import Dataset
+
+```{r Import Dataset}
+data_path <- "/Users/chien/Library/CloudStorage/OneDrive-McGillUniversity/5d_Network_Analysis/Exercise4/app_data_sample.parquet" # change this to your path
+applications <- read_parquet(data_path)
+edges <- read_csv('/Users/chien/Library/CloudStorage/OneDrive-McGillUniversity/5d_Network_Analysis/Exercise4/edges_sample.csv', show_col_types = FALSE)
+```
+
+# Part 1. Processing of dataset to include gender, race, tenure, application days for examiners
+
+## Adding gender to dataset based on surnames library
+
+This R script enriches an existing dataset named `applications` by assigning genders to examiner names based on their first names, utilizing the `gender` library which infers gender from names using historical data from the U.S. Social Security Administration. It begins by extracting unique first names from the dataset and then employs the `gender` function to estimate each name's gender. The script further simplifies the data by focusing on essential fields - the first name and its inferred gender. This gender information is then merged back into the `applications` dataset. Finally, the script cleans up by removing temporary variables and calling the garbage collector to free up memory resources. The outcome is an enhanced version of the `applications` dataset that includes gender information for each examiner, facilitating analyses related to gender diversity.
+
+```{r Gender-related processing}
+library(gender)
+examiner_names <- applications %>%
+        distinct(examiner_name_first)
+
+examiner_names_gender <- examiner_names %>%
+        do(results = gender(.$examiner_name_first, method = "ssa")) %>%
+        unnest(cols = c(results), keep_empty = TRUE) %>%
+        select(
+                examiner_name_first = name,
+                gender,
+                proportion_female)
+
+# remove extra colums from the gender table
+examiner_names_gender <- examiner_names_gender %>%
+        select(examiner_name_first, gender)
+
+# joining gender back to the dataset
+applications <- applications %>%
+        left_join(examiner_names_gender, by = "examiner_name_first")
+
+# cleaning up
+rm(examiner_names)
+rm(examiner_names_gender)
+gc()
+```
+
+## Adding race to dataset using race library
+
+This script utilizes the `wru` library to append racial background estimations to an `applications` dataset based on examiner surnames. By extracting unique surnames and applying the `predict_race` function, it calculates the likelihood of each surname being associated with specific racial groups. The script identifies the race with the highest probability for each surname and simplifies the data to include just surnames and their most likely racial categorization. These enriched racial data are then merged back into the original dataset, offering a nuanced layer of racial background information. The process concludes with a cleanup of temporary variables and memory optimization, enhancing the dataset's utility for analyses concerning racial diversity or related studies.
+
+```{r Race-related processing}
+library(wru)
+
+examiner_surnames <- applications %>%
+        select(surname = examiner_name_last) %>%
+        distinct()
+
+examiner_race <- predict_race(voter.file = examiner_surnames, surname.only = T) %>%
+        as_tibble()
+
+examiner_race <- examiner_race %>%
+        mutate(max_race_p = pmax(pred.asi, pred.bla, pred.his, pred.oth, pred.whi)) %>%
+        mutate(race = case_when(
+                max_race_p == pred.asi ~ "Asian",
+                max_race_p == pred.bla ~ "black",
+                max_race_p == pred.his ~ "Hispanic",
+                max_race_p == pred.oth ~ "other",
+                max_race_p == pred.whi ~ "white",
+                TRUE ~ NA_character_
+        ))
+
+# removing extra columns
+examiner_race <- examiner_race %>%
+        select(surname,race)
+
+applications <- applications %>%
+        left_join(examiner_race, by = c("examiner_name_last" = "surname"))
+
+rm(examiner_race)
+rm(examiner_surnames)
+gc()
+```
+
+## Adding dates-related data to calculate tenure days
+
+This script leverages the `lubridate` library for date manipulation within an `applications` dataset, focusing on processing examiners' filing and status update dates to derive their tenure. Initially, it selects relevant date fields along with the examiner ID, converting string date formats into `lubridate`-compatible date objects for accurate computation. The script calculates each examiner's earliest filing date and latest status update date, determining their tenure in days by measuring the interval between these dates. It further filters the data to include only records where the latest date is before 2018, ensuring the analysis pertains to a specific time frame. Finally, it enriches the original `applications` dataset by merging these tenure calculations back in, based on examiner IDs. The procedure concludes with a cleanup step, removing temporary variables and calling the garbage collector to manage memory efficiently. The outcome is an augmented dataset with detailed tenure information, facilitating analyses related to examiners' durations of activity within the dataset's context.
+
+```{r Dates-related processing}
+library(lubridate) # to work with dates
+
+examiner_dates <- applications %>%
+        select(examiner_id, filing_date, appl_status_date)
+
+examiner_dates <- examiner_dates %>%
+        mutate(start_date = ymd(filing_date), end_date = as_date(dmy_hms(appl_status_date)))
+
+examiner_dates <- examiner_dates %>%
+        group_by(examiner_id) %>%
+        summarise(
+                earliest_date = min(start_date, na.rm = TRUE),
+                latest_date = max(end_date, na.rm = TRUE),
+                tenure_days = interval(earliest_date, latest_date) %/% days(1)
+        ) %>%
+        filter(year(latest_date)<2018)
+
+applications <- applications %>%
+        left_join(examiner_dates, by = "examiner_id")
+
+rm(examiner_dates)
+gc()
+```
+
+## Adding application processing time
+
+This R script efficiently processes an applications dataset to analyze the timeline from filing to a final decision, either a patent issuance or abandonment. Initially, it filters out applications that lack a decision, retaining those with either a patent issue date or an abandon date. Subsequently, it merges these two decision-related dates into a singular `final_decision_date` column, prioritizing the patent issue date when both are available. The script then calculates the processing time for each application by determining the difference in days between the filing date and the final decision date. This involves converting date strings to date objects to ensure accurate arithmetic operations, facilitating a comprehensive analysis of the application processing duration within the dataset. This streamlined approach allows for a detailed examination of the timelines associated with patent applications, highlighting the efficiency of the patent examination process.
+
+```{r Application Processing Time}
+
+# first filter out rows without NA in both patent_issue_date and abandon_date
+
+filtered_applications <- applications %>%
+  filter(!(is.na(patent_issue_date) & is.na(abandon_date)))
+
+# next, combine both the columns to form a new column called final_decision_date
+
+filtered_applications <- filtered_applications %>%
+  mutate(
+    final_decision_date = coalesce(patent_issue_date, abandon_date)
+  )
+
+# calculate the differences in application processing days
+
+filtered_applications <- filtered_applications %>%
+  mutate(
+    filing_date = ymd(filing_date), # Convert filing_date to Date format if necessary
+    final_decision_date = ymd(final_decision_date) # Convert final_decision_date to Date format if necessary
+  ) %>%
+  mutate(
+    decision_day_difference = as.numeric(difftime(final_decision_date, filing_date, units = "days"))
+  )
+```
+
+## Create a dataset: Unique Examiners
+
+This segment of R code delves into analyzing the performance of patent examiners by extracting unique identifiers and associated attributes, then calculating and appending the average application processing time for each. Initially, it isolates distinct examiner identities from a pre-processed dataset (`filtered_applications`), selecting specific attributes such as the examiner's ID, art unit, race, gender, and tenure days, to create a unique profile for each examiner. Following this, it computes the average application processing time per examiner by grouping the data by `examiner_id` and averaging the `decision_day_difference`, which represents the time taken from filing to a decision being made on each application, thus providing a metric of examiner efficiency. This average processing time is then merged back with the unique examiner profiles, creating a comprehensive dataset that not only highlights the demographic and professional attributes of each examiner but also includes a performance metric in the form of average processing time. This enriched dataset is then displayed, offering insights into the operational dynamics and diversity within the patent examination process, combining performance analysis with demographic data for a multifaceted view of examiner productivity and diversity.
+
+```{r Unique Examiners}
+
+# Extract unique examiner attributes
+unique_examiners <- filtered_applications %>%
+  select(examiner_id, examiner_art_unit, race, gender, tenure_days) %>%
+  distinct(examiner_id, examiner_art_unit, .keep_all = TRUE)
+
+# Calculate the average application processing time for each unique examiner
+average_processing_time <- filtered_applications %>%
+  group_by(examiner_id) %>%
+  summarise(avg_app_proc_time = mean(decision_day_difference, na.rm = TRUE)) %>%
+  ungroup()
+
+# Join the average processing time with the unique examiners data
+unique_examiners <- unique_examiners %>%
+  left_join(average_processing_time, by = "examiner_id")
+
+# View the unique examiners list with average processing time
+print(head(unique_examiners))
+```
+
+## Check for NA values in the dataset
+
+This R script segment focuses on identifying and handling missing values (NA) within the `unique_examiners` dataset, ensuring data integrity and cleanliness. Initially, it calculates and prints the total count of NA values across each column, offering a preliminary overview of data completeness. Following this, the script isolates and displays records with missing `examiner_id` values, pinpointing entries that lack this crucial identifier. To maintain dataset quality, these entries are subsequently filtered out, retaining only those records with valid `examiner_id` information. This filtration ensures that further analyses or operations are based on complete and meaningful data. The cleaned dataset is then presented to confirm the removal of the identified incomplete records. Finally, a reevaluation of NA counts across columns is conducted and displayed, verifying the effectiveness of the cleaning process and ensuring that the dataset is devoid of entries missing the essential `examiner_id` field. This meticulous approach to data cleaning underscores the importance of data quality in analytical processes, particularly in contexts where identifiers like `examiner_id` play a critical role in linking and analyzing data accurately.
+
+```{r Check for NA values}
+
+na_count_by_column <- colSums(is.na(unique_examiners))
+print(na_count_by_column)
+
+na_examiner_id_data <- unique_examiners %>%
+  filter(is.na(examiner_id))
+
+# View the filtered data
+print(head(na_examiner_id_data))
+
+unique_examiners <- unique_examiners %>%
+  filter(!is.na(examiner_id))
+
+# View the cleaned data
+print(unique_examiners)
+
+# Check for NA values again
+na_count_by_column <- colSums(is.na(unique_examiners))
+print(na_count_by_column)
+```
+
+After removing examiners with NA values, there is still 1448 NA values within gender. The following code calculates the percentage of NA values in gender respective to the whole dataset.
+
+```{r Calculate  % of gender NA values}
+
+# Total number of rows in the dataset
+total_rows <- nrow(unique_examiners)
+
+# Number of missing values in the 'gender' column (as per your output)
+missing_values_gender <- 1470
+
+# Calculate the percentage of missing values
+percentage_missing_gender <- (missing_values_gender / total_rows) * 100
+
+# Print the result
+cat("Percentage of missing values in 'gender':", percentage_missing_gender, "%\n")
+
+```
+
+Given that there is only 14.4% of missing values within gender, we will proceed to drop the rows that has NA in the gender. We will ignore tenure_days with NA values as it is not crucial in our analysis.
+
+```{r Removing rows with NA in gender column}
+# Filter out rows where 'gender' is NA
+unique_examiners_clean <- unique_examiners %>%
+  filter(!is.na(gender))
+
+# Check for NA values again
+na_count_by_column <- colSums(is.na(unique_examiners_clean))
+print(na_count_by_column)
+```
+
+# Part 2. Using Linear Regression to estimate relationship between centrality and app_proc_time
+
+## Preparing the edges dataset
+
+This R script meticulously prepares an `edges` dataset for network analysis by first identifying and removing rows with missing values in critical columns, specifically `ego_examiner_id` and `alter_examiner_id`, which represent the primary and secondary examiners in a relational network. After each step of cleaning, it reassesses the dataset to ensure no NA values remain in these key columns. Subsequently, the script transforms the cleaned dataset to calculate the `weight` of each unique examiner pair, defined by the distinct count of `application_number` associated with them, thus quantifying the strength or frequency of their interactions. The final transformation includes renaming the examiner ID columns for clarity and displaying a preview of the transformed data. This process not only guarantees the data's integrity for accurate network analysis but also structures it into a format that highlights the connections and interaction intensity among the examiners, setting the stage for in-depth network dynamics studies.
+
+``` {r Preparing edges dataset}
+
+library(dplyr)
+
+# Check for NA values
+na_count_by_column <- colSums(is.na(edges))
+print(na_count_by_column)
+
+# Drop rows with NA ego_examiner_id
+edges_cleaned <- edges %>%
+  filter(!is.na(ego_examiner_id))
+
+# Check for NA values
+na_count_by_column <- colSums(is.na(edges_cleaned))
+print(na_count_by_column)
+
+# Drop rows with NA alter_examiner_id
+edges_cleaned <- edges_cleaned %>%
+  filter(!is.na(alter_examiner_id))
+
+# Check for NA values
+na_count_by_column <- colSums(is.na(edges_cleaned))
+print(na_count_by_column)
+
+# Transform the data to calculate weights
+edges_transformed <- edges_cleaned %>%
+  group_by(ego_examiner_id, alter_examiner_id) %>%
+  summarise(weight = n_distinct(application_number), .groups = "drop") %>%
+  rename(ego = ego_examiner_id, alter = alter_examiner_id)
+
+# View the transformed data
+print(head(edges_transformed))
+
+```
+## Calculating centrality values
+
+This R code snippet utilizes the `igraph` package to calculate various centrality measures for nodes in a directed network graph created from the `edges_transformed` dataframe. The centrality measures calculated are in-degree and out-degree centrality, betweenness centrality, closeness centrality (both in and out), and eigenvector centrality, incorporating edge weights where applicable. In-degree and out-degree centralities are calculated to assess the popularity and outreach of nodes, respectively, highlighting nodes that receive many connections and those that initiate many connections within the network. Betweenness centrality identifies nodes that frequently act as bridges or connectors between other nodes, emphasizing their role in facilitating communication or the flow within the network. Closeness centrality, calculated for both incoming and outgoing connections, measures how close a node is to all other nodes, indicating the efficiency of a node in spreading information or reaching out to the network. Eigenvector centrality reflects the influence of a node, considering not just the quantity but the quality of its connections, by factoring in the centrality of the nodes it is connected to. These centrality measures, especially when calculated for both incoming and outgoing connections in a directed network, provide a comprehensive understanding of the roles, influences, and interactions of nodes, revealing the underlying dynamics and structure of the network.
+
+``` {r Calculate centrality values}
+
+library(igraph)
+
+# Create a directed igraph object from the edges_transformed dataframe
+g <- graph_from_data_frame(d=edges_transformed, directed=TRUE, vertices=NULL)
+
+# Calculate degree centrality (In-degree and Out-degree)
+in_degree_centrality <- degree(g, mode="in")
+out_degree_centrality <- degree(g, mode="out")
+
+# Calculate betweenness centrality, incorporating weights
+betweenness_centrality <- betweenness(g, directed=TRUE, weights=E(g)$weight)
+
+# Since closeness centrality in directed graphs can be different for in and out,
+# calculate them both, incorporating weights
+in_closeness_centrality <- closeness(g, mode="in", weights=E(g)$weight)
+out_closeness_centrality <- closeness(g, mode="out", weights=E(g)$weight)
+
+# Calculate eigenvector centrality, incorporating weights
+eigenvector_centrality <- eigen_centrality(g, directed=TRUE, weights=E(g)$weight)$vector
+
+# Creating a dataframe to store the centrality measures
+centrality_measures <- data.frame(
+  examiner_id = V(g)$name,
+  in_degree = in_degree_centrality,
+  out_degree = out_degree_centrality,
+  betweenness = betweenness_centrality,
+  in_closeness = in_closeness_centrality,
+  out_closeness = out_closeness_centrality,
+  eigenvector = eigenvector_centrality
+)
+
+# View the centrality measures
+head(centrality_measures)
+
+```
+
+## Running Linear Regression Models to Estimate Relationship
+
+This code first ensures that examiner_id in both `unique_examiners_clean` and `centrality_measures` is of type character by using the mutate() and as.character() functions. Once both examiner_id columns are of the same type, the left_join() operation can proceed without type compatibility issues, successfully merging the datasets based on the examiner_id column.
+
+``` {r Combining Datasets}
+
+# first merge the two datasets unique_examiners_clean and centrality_measures
+library(dplyr)
+
+# Convert examiner_id in unique_examiners_clean to character if it's numeric
+unique_examiners_clean <- unique_examiners_clean %>%
+  mutate(examiner_id = as.character(examiner_id))
+
+# Ensure examiner_id in centrality_measures is also character
+# This step may be redundant if it's already a character, but it's good practice to ensure compatibility
+centrality_measures <- centrality_measures %>%
+  mutate(examiner_id = as.character(examiner_id))
+
+# Now perform the left join
+combined_data <- unique_examiners_clean %>%
+  left_join(centrality_measures, by = "examiner_id")
+
+# View the first few rows of the combined dataset
+head(combined_data)
+```
+## Running Linear Regression Models to Estimate Relationship between Centrality and Average Processing Time
+
+The results of the linear regression model indicate how various centrality measures and network characteristics relate to the average application processing time (`avg_app_proc_time`) for examiners. The model includes centrality measures (in-degree, out-degree, betweenness, in-closeness, out-closeness, and eigenvector) as predictors.
+
+``` {r Linear Regression}
+
+linear_model <- lm(avg_app_proc_time ~ in_degree + out_degree + betweenness + in_closeness + out_closeness + eigenvector, 
+                   data = combined_data)
+
+summary(linear_model)
+```
+
+```{r model-table, echo=FALSE, results='asis'}
+library(knitr)
+
+# Assuming your model is stored in a variable called linear_model
+model_summary <- summary(linear_model)$coefficients
+
+# Create a nicely formatted table
+kable(model_summary, caption = "Linear Regression Model Summary",
+      col.names = c("Estimate", "Std. Error", "t value", "Pr(>|t|)"),
+      format = "markdown")
+
+```
+
+### Interpretation of Coefficients:
+- **Intercept (1.307e+03)**: The expected `avg_app_proc_time` when all predictors are zero is approximately 1307 days. This high intercept suggests that even in the absence of network effects, the processing time is substantial.
+- **In-Degree (1.821e+00, p=0.1546)**: Each additional in-degree point is associated with an increase in processing time by about 1.82 days, although this effect is not statistically significant (p > 0.05).
+- **Out-Degree (2.094e+00, p=0.0105)**: Each additional out-degree point increases processing time by approximately 2.09 days, and this relationship is statistically significant (p < 0.05), indicating that examiners who have more outgoing connections tend to have longer processing times.
+- **Betweenness (1.162e-03, p=0.0699)**: A higher betweenness centrality is associated with a slight increase in processing time, although this effect is marginally significant (p just above 0.05), suggesting a potential role of being a bottleneck in the information flow.
+- **In-Closeness (4.378e+00, p=0.8277)** and **Out-Closeness (-1.037e+02, p=2.05e-06)**: In-closeness centrality does not significantly affect processing time, whereas out-closeness has a significant negative impact, decreasing processing time by about 103.7 days for each unit increase. This suggests that examiners who are closer (in terms of out-closeness) to others in the network process applications more quickly, likely due to more efficient information or resource access.
+- **Eigenvector (4.567e+02, p=0.0832)**: Having a higher eigenvector centrality, which indicates connections to well-connected nodes, is associated with an increase in processing time by about 456.7 days, although this effect is not statistically significant (p > 0.05).
+
+### Model Summary:
+- **Residual Standard Error**: The average difference between the observed and predicted `avg_app_proc_time` is about 265.4 days, indicating variability in processing times not captured by the model.
+- **R-squared (0.05182)**: Only about 5.18% of the variance in `avg_app_proc_time` is explained by the model, suggesting that while the centrality measures have some effect, other unmodeled factors are also at play.
+- **F-Statistic (p-value: 7.114e-14)**: The model is statistically significant overall, indicating that at least some of the centrality measures meaningfully relate to processing times, even if the effect size is small for some predictors.
+
+# Part 3. Incorporating examiner gender into linear model
+
+The linear regression model explores how centrality measures and their interactions with gender influence the average application processing time (`avg_app_proc_time`), revealing the nuanced interplay between an examiner's network position, gender, and processing efficiency.
+
+``` {r Linear Model with Interactions}
+
+linear_model_with_interaction <- lm(avg_app_proc_time ~ in_degree * gender + out_degree * gender + betweenness * gender + 
+                                    in_closeness * gender + out_closeness * gender + eigenvector * gender, 
+                                    data = combined_data)
+
+summary(linear_model_with_interaction)
+```
+
+```{r model-table-2, echo=FALSE, results='asis'}
+library(knitr)
+
+# Assuming your model is stored in a variable called linear_model
+model_summary <- summary(linear_model_with_interaction)$coefficients
+
+# Create a nicely formatted table
+kable(model_summary, caption = "Linear Regression Model Summary",
+      col.names = c("Estimate", "Std. Error", "t value", "Pr(>|t|)"),
+      format = "markdown")
+
+```
+
+### Main Effects:
+- **Intercept (1.232e+03)**: The baseline processing time is approximately 1232 days for the reference gender category (assuming female if "male" is specified).
+- **In-Degree (3.903, p=0.03474)**: Holding other variables constant, an increase in in-degree centrality is associated with a 3.903-day increase in processing time, indicating that more inbound connections slightly increase processing times.
+- **Gender (male) (1.039e+02, p=0.00152)**: Male examiners, on average, have a 103.9-day longer processing time than their counterparts, suggesting gender disparities in processing times.
+- **Out-Degree (3.882, p=0.04723)**: An increase in out-degree centrality marginally increases processing time by 3.882 days, suggesting that more outbound connections could slightly increase workload or processing times.
+- **Eigenvector (5.404e+02, p=0.04078)**: Higher eigenvector centrality, indicating influential positions within the network, is associated with a significant increase (540.4 days) in processing time, possibly due to involvement in more complex or numerous cases.
+
+### Interaction Effects:
+- **In-Degree and Gender (Male) (-3.730, p=0.14705)**: The interaction term suggests that the relationship between in-degree centrality and processing time differs by gender, although this effect is not statistically significant.
+- **Betweenness and Gender (Male) (4.054e-03, p=0.01144)**: This significant interaction indicates that the effect of betweenness centrality on processing time is more pronounced for male examiners, suggesting gender differences in how being a network bridge affects workload.
+
+### Model Summary:
+- **Residual Standard Error (262.6)**: Indicates the average difference between the observed and predicted processing times, suggesting variability not captured by the model.
+- **Multiple R-squared (0.07611)**: Only 7.611% of the variance in processing time is explained by the model, indicating that while centrality measures and gender do impact processing times, much of the variation is due to other unaccounted factors.
+- **F-statistic (p-value: < 2.2e-16)**: Demonstrates that the model is statistically significant, meaning that there is a relationship between the combined predictors and processing time, even if individual predictors vary in their impact.
+
+# Part 4. Findings and Implications for USPTO
+
+## Implications from Network Position (Part 2):
+
+**Efficiency and Network Position:** The relationship between an examiner's network centrality, particularly out-closeness centrality, and application processing times indicates that examiners who are more central in their outgoing connections within the network tend to process applications more efficiently. This could be because centrally located examiners have better access to information, resources, or support from colleagues, facilitating quicker decision-making.
+
+**Policy and Training:** USPTO might consider policies or training programs aimed at enhancing the connectivity and resource sharing among examiners. Encouraging a culture of collaboration and information exchange could leverage the benefits of network centrality to improve overall processing times. Additionally, identifying and supporting examiners who are less central could help in balancing workloads and efficiency across the board.
+
+## Implications from Gender Differences (Part 3):
+
+**Gender and Workload Efficiency:** The interaction between gender and network centrality measures on processing times underscores that gender plays a role in how network position affects workload management. This suggests that male and female examiners might experience or leverage their network positions differently, potentially due to varying access to resources or differences in collaboration patterns.
+
+**Addressing Gender Disparities:** Acknowledging and addressing any underlying gender disparities is crucial. USPTO could benefit from further investigating the causes behind these differences and implementing measures to ensure equitable access to resources and support for all examiners, regardless of gender. This could involve mentorship programs, targeted training, or efforts to foster a more inclusive network environment.
+
+## Additional Considerations
+
+The relatively low R-squared values from both parts suggest that the models capture only a small portion of the variance in application processing times at the USPTO. This indicates a complex interplay of factors beyond network centrality and gender influencing processing efficiency. Here are steps USPTO can take to address these findings and improve their understanding and management of processing times:
+
+**1. Expand Data Collection:** USPTO should consider broadening the scope of data collection to include additional variables that could influence processing times. This may include examiner workload, complexity of applications, technological area differences, examiner experience beyond tenure (such as training and educational background), and external factors like changes in patent law or application trends.
+
+**2. Conduct Qualitative Research:** In-depth interviews or surveys with examiners could uncover qualitative factors that impact processing times, such as personal work strategies, the role of teamwork and collaboration, or administrative support. Understanding these nuances can provide insights that quantitative data alone may not reveal.
+
+**3. Implement Advanced Analytical Techniques:** Employing more sophisticated statistical or machine learning models could help uncover complex relationships between processing times and potential predictors. Techniques like random forests, gradient boosting machines, or neural networks can model non-linear relationships and interactions more effectively than linear regression.
+
+
+
+
+
+
+
+
+
